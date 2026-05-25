@@ -11,14 +11,17 @@ const BOT_SECRET = process.env.BOT_SECRET || "rainx-bot-secret";
 const SIGN_SECRET = process.env.SIGN_SECRET || "rainx-sign-secret-xyz";
 const DATA_FILE = path.join(__dirname, "data.json");
 
-const usedTokens = new Map();
+// challenge store: challengeId -> { challenge, hwid, key, expireAt }
+const challenges = new Map();
+const usedChallenges = new Set();
 
+// cleanup every 30s
 setInterval(() => {
     const now = Date.now();
-    for (const [token, exp] of usedTokens.entries()) {
-        if (now > exp) usedTokens.delete(token);
+    for (const [id, val] of challenges.entries()) {
+        if (now > val.expireAt) challenges.delete(id);
     }
-}, 60000);
+}, 30000);
 
 function loadData() {
     try {
@@ -65,30 +68,54 @@ function botAuth(req, res, next) {
     next();
 }
 
+// ====== STEP 1: Lua ขอ challenge ======
+app.post("/challenge", (req, res) => {
+    const { key, hwid } = req.body;
+    if (!key || !hwid) return res.status(400).json({ ok: false });
+
+    // สร้าง challenge id และ challenge string แบบ random
+    const challengeId = crypto.randomBytes(16).toString("hex");
+    const challenge = crypto.randomBytes(32).toString("hex");
+
+    // เก็บไว้ 20 วินาที
+    challenges.set(challengeId, {
+        challenge,
+        key,
+        hwid,
+        expireAt: Date.now() + 20000
+    });
+
+    // ส่งแค่ challengeId และ challenge กลับไป
+    // Lua ไม่รู้ secret เลย ไม่ต้องเซ็นอะไร
+    res.json({ ok: true, challengeId, challenge });
+});
+
+// ====== STEP 2: Lua ส่ง challengeId กลับมา server เช็คเอง ======
 app.post("/verify", (req, res) => {
-    const { key, hwid, token, ts } = req.body;
-    if (!key || !hwid || !token || !ts)
+    const { challengeId, hwid } = req.body;
+    if (!challengeId || !hwid) 
         return res.json(makeSignedResponse({ ok: false, reason: "กากไอสัส" }));
 
-    const now = nowSec();
-    if (Math.abs(now - ts) > 15)
+    // เช็คว่า challenge ยังไม่ถูกใช้
+    if (usedChallenges.has(challengeId))
         return res.json(makeSignedResponse({ ok: false, reason: "กากไอสัส" }));
 
-    if (usedTokens.has(token))
+    // หา challenge
+    const entry = challenges.get(challengeId);
+    if (!entry)
         return res.json(makeSignedResponse({ ok: false, reason: "กากไอสัส" }));
 
-    const expectedToken = crypto
-        .createHmac("sha256", SIGN_SECRET)
-        .update(`${key}:${hwid}:${ts}`)
-        .digest("hex");
-
-    if (token !== expectedToken)
+    // เช็คว่า hwid ตรงกับตอนขอ challenge
+    if (entry.hwid !== hwid)
         return res.json(makeSignedResponse({ ok: false, reason: "กากไอสัส" }));
 
-    usedTokens.set(token, Date.now() + 30000);
+    // mark ว่าใช้แล้ว
+    usedChallenges.add(challengeId);
+    challenges.delete(challengeId);
+    setTimeout(() => usedChallenges.delete(challengeId), 30000);
 
     const data = loadData();
-    const keyData = data.keys[key];
+    const keyData = data.keys[entry.key];
 
     if (!keyData)
         return res.json(makeSignedResponse({ ok: false, reason: "Key ไม่ถูกต้องนะ" }));
@@ -99,12 +126,13 @@ app.post("/verify", (req, res) => {
         return res.json(makeSignedResponse({ ok: false, reason: "Key หมดอายุแล้ว" }));
     }
 
+    // HWID check (hash)
     const hashedHwid = crypto.createHash("sha256").update(hwid).digest("hex");
     if (keyData.hwid && keyData.hwid !== "" && keyData.hwid !== hashedHwid)
         return res.json(makeSignedResponse({ ok: false, reason: "reset hwid ก่อนน่ะ" }));
 
     if (!keyData.hwid || keyData.hwid === "") keyData.hwid = hashedHwid;
-    if (!keyData.redeemedAt || keyData.redeemedAt === 0) keyData.redeemedAt = now;
+    if (!keyData.redeemedAt || keyData.redeemedAt === 0) keyData.redeemedAt = nowSec();
     keyData.active = true;
     keyData.expired = false;
     keyData.executionCount = (keyData.executionCount || 0) + 1;
@@ -113,6 +141,7 @@ app.post("/verify", (req, res) => {
     return res.json(makeSignedResponse({ ok: true, scriptUrl: data.config.scriptUrl || null }));
 });
 
+// ====== BOT ENDPOINTS ======
 app.post("/keys/generate", botAuth, (req, res) => {
     const { duration, amount } = req.body;
     const data = loadData();
