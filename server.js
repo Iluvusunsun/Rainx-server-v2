@@ -15,12 +15,8 @@ const DATA_FILE = path.join(__dirname, "data.json");
 const sessions = new Map();       // sessionId -> entry
 const usedSessions = new Set();   // used sessionIds
 const rateLimitMap = new Map();   // hwid -> { count, resetAt }
-const bannedHwids = new Set();    // banned hwids
-const strikeMap = new Map();      // hwid -> strike count
 
 const RATE_LIMIT = 8;
-const MAX_STRIKES = 3;
-
 setInterval(() => {
     const now = Date.now();
     for (const [id, val] of sessions.entries()) {
@@ -38,13 +34,11 @@ function loadData() {
             fs.writeFileSync(DATA_FILE, JSON.stringify({ keys: {}, config: {}, bannedHwids: [] }));
         }
         const d = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-        if (d.bannedHwids) d.bannedHwids.forEach(h => bannedHwids.add(h));
         return d;
     } catch { return { keys: {}, config: {}, bannedHwids: [] }; }
 }
 
 function saveData(data) {
-    data.bannedHwids = [...bannedHwids];
     fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
 }
 
@@ -73,17 +67,6 @@ function encryptResponse(data, sessionKey) {
     };
 }
 
-function addStrike(hwid) {
-    const s = (strikeMap.get(hwid) || 0) + 1;
-    strikeMap.set(hwid, s);
-    if (s >= MAX_STRIKES) {
-        bannedHwids.add(hwid);
-        const data = loadData();
-        saveData(data);
-    }
-    return s;
-}
-
 function checkRate(hwid) {
     const now = Date.now();
     const e = rateLimitMap.get(hwid) || { count: 0, resetAt: now + 60000 };
@@ -103,15 +86,12 @@ function botAuth(req, res, next) {
 function guard(req, res, next) {
     const { hwid } = req.body;
     if (!hwid) return res.json({ e: "bad" });
-    if (bannedHwids.has(hwid)) return res.json({ e: "banned" });
     if (!checkRate(hwid)) {
-        addStrike(hwid);
         return res.json({ e: "rate" });
     }
     const suspicious = ["x-debug", "x-proxy", "via", "x-forwarded-host"];
     for (const h of suspicious) {
         if (req.headers[h]) {
-            addStrike(hwid);
             return res.json({ e: "bad" });
         }
     }
@@ -124,11 +104,9 @@ app.post("/cdn-cgi/challenge", guard, (req, res) => {
     const { key, hwid, ts, nonce } = req.body;
     if (!key || !hwid || !ts || !nonce) return res.json({ e: "bad" });
     if (Math.abs(nowSec() - ts) > 10) {
-        addStrike(hwid);
         return res.json({ e: "ts" });
     }
     if (!/^[a-f0-9]{32}$/.test(nonce)) {
-        addStrike(hwid);
         return res.json({ e: "bad" });
     }
 
@@ -167,18 +145,15 @@ app.post("/cdn-cgi/token", guard, (req, res) => {
     const { s, hwid, ts, nonce } = req.body;
     if (!s || !hwid || !ts || !nonce) return res.json({ e: "bad" });
     if (Math.abs(nowSec() - ts) > 10) {
-        addStrike(hwid);
         return res.json({ e: "ts" });
     }
     if (usedSessions.has(s)) {
-        addStrike(hwid);
         return res.json({ e: "used" });
     }
 
     const entry = sessions.get(s);
     if (!entry) { addStrike(hwid); return res.json({ e: "sess" }); }
     if (entry.hwid !== hwid || entry.nonce !== nonce) {
-        addStrike(hwid);
         return res.json({ e: "bad" });
     }
 
@@ -197,7 +172,6 @@ app.post("/cdn-cgi/token", guard, (req, res) => {
 
     const hashedHwid = crypto.createHash("sha256").update(hwid).digest("hex");
     if (keyData.hwid && keyData.hwid !== "" && keyData.hwid !== hashedHwid) {
-        addStrike(hwid);
         return res.json({ e: "hwid" });
     }
 
@@ -304,18 +278,6 @@ app.get("/config", botAuth, (req, res) => {
     res.json({ ok: true, config: data.config });
 });
 
-app.post("/ban/:hwid", botAuth, (req, res) => {
-    bannedHwids.add(req.params.hwid);
-    const data = loadData(); saveData(data);
-    res.json({ ok: true });
-});
-
-app.delete("/ban/:hwid", botAuth, (req, res) => {
-    bannedHwids.delete(req.params.hwid);
-    strikeMap.delete(req.params.hwid);
-    const data = loadData(); saveData(data);
-    res.json({ ok: true });
-});
 
 app.get("/ping", (req, res) => res.send("pong"));
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
