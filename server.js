@@ -12,20 +12,19 @@ const SIGN_SECRET = process.env.SIGN_SECRET || "rainx-sign-secret-xyz";
 const DATA_FILE = path.join(__dirname, "data.json");
 
 // ====== STORES ======
-const challenges = new Map();      // challengeId -> entry
-const usedChallenges = new Set();  // used challengeIds
-const rateLimitMap = new Map();    // hwid -> { count, resetAt }
-const bannedHwids = new Set();     // banned hwids
-const suspiciousMap = new Map();   // hwid -> strike count
+const sessions = new Map();       // sessionId -> entry
+const usedSessions = new Set();   // used sessionIds
+const rateLimitMap = new Map();   // hwid -> { count, resetAt }
+const bannedHwids = new Set();    // banned hwids
+const strikeMap = new Map();      // hwid -> strike count
 
-const RATE_LIMIT = 10;             // max 10 requests per minute per hwid
-const MAX_STRIKES = 3;             // โดน ban หลัง 3 strikes
+const RATE_LIMIT = 8;
+const MAX_STRIKES = 3;
 
-// cleanup every 60s
 setInterval(() => {
     const now = Date.now();
-    for (const [id, val] of challenges.entries()) {
-        if (now > val.expireAt) challenges.delete(id);
+    for (const [id, val] of sessions.entries()) {
+        if (now > val.expireAt) sessions.delete(id);
     }
     for (const [hwid, val] of rateLimitMap.entries()) {
         if (now > val.resetAt) rateLimitMap.delete(hwid);
@@ -39,12 +38,9 @@ function loadData() {
             fs.writeFileSync(DATA_FILE, JSON.stringify({ keys: {}, config: {}, bannedHwids: [] }));
         }
         const d = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-        // restore banned hwids
         if (d.bannedHwids) d.bannedHwids.forEach(h => bannedHwids.add(h));
         return d;
-    } catch {
-        return { keys: {}, config: {}, bannedHwids: [] };
-    }
+    } catch { return { keys: {}, config: {}, bannedHwids: [] }; }
 }
 
 function saveData(data) {
@@ -54,46 +50,47 @@ function saveData(data) {
 
 function nowSec() { return Math.floor(Date.now() / 1000); }
 
-function isExpired(keyData) {
-    if (keyData.duration === -1) return false;
-    if (keyData.expired === true) return true;
-    if (!keyData.redeemedAt || keyData.redeemedAt === 0) return false;
-    return nowSec() >= (keyData.redeemedAt + keyData.duration);
+function isExpired(k) {
+    if (k.duration === -1) return false;
+    if (k.expired) return true;
+    if (!k.redeemedAt || k.redeemedAt === 0) return false;
+    return nowSec() >= (k.redeemedAt + k.duration);
 }
 
-function signPayload(payload) {
-    return crypto.createHmac("sha256", SIGN_SECRET)
-        .update(JSON.stringify(payload)).digest("hex");
-}
-
-function makeSignedResponse(data) {
-    const payload = { ...data, ts: nowSec() };
-    payload.sig = signPayload({ ...data, ts: payload.ts });
-    return payload;
+// เข้ารหัส response ด้วย AES-256-GCM
+function encryptResponse(data, sessionKey) {
+    const key = Buffer.from(sessionKey, "hex");
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+    const json = JSON.stringify(data);
+    let enc = cipher.update(json, "utf8", "base64");
+    enc += cipher.final("base64");
+    const tag = cipher.getAuthTag().toString("base64");
+    return {
+        d: enc,
+        iv: iv.toString("base64"),
+        t: tag
+    };
 }
 
 function addStrike(hwid) {
-    const strikes = (suspiciousMap.get(hwid) || 0) + 1;
-    suspiciousMap.set(hwid, strikes);
-    if (strikes >= MAX_STRIKES) {
+    const s = (strikeMap.get(hwid) || 0) + 1;
+    strikeMap.set(hwid, s);
+    if (s >= MAX_STRIKES) {
         bannedHwids.add(hwid);
         const data = loadData();
         saveData(data);
-        console.log(`🔨 Banned HWID: ${hwid}`);
     }
-    return strikes;
+    return s;
 }
 
-function checkRateLimit(hwid) {
+function checkRate(hwid) {
     const now = Date.now();
-    const entry = rateLimitMap.get(hwid) || { count: 0, resetAt: now + 60000 };
-    if (now > entry.resetAt) {
-        entry.count = 0;
-        entry.resetAt = now + 60000;
-    }
-    entry.count++;
-    rateLimitMap.set(hwid, entry);
-    return entry.count <= RATE_LIMIT;
+    const e = rateLimitMap.get(hwid) || { count: 0, resetAt: now + 60000 };
+    if (now > e.resetAt) { e.count = 0; e.resetAt = now + 60000; }
+    e.count++;
+    rateLimitMap.set(hwid, e);
+    return e.count <= RATE_LIMIT;
 }
 
 function botAuth(req, res, next) {
@@ -102,138 +99,106 @@ function botAuth(req, res, next) {
     next();
 }
 
-// ====== LUA MIDDLEWARE ======
-function luaGuard(req, res, next) {
-    const hwid = req.body?.hwid;
-    if (!hwid) return res.json(makeSignedResponse({ ok: false, reason: "โง่:>" }));
-
-    // banned check
-    if (bannedHwids.has(hwid))
-        return res.json(makeSignedResponse({ ok: false, reason: "โดน ban แล้วนะโง่:>" }));
-
-    // rate limit
-    if (!checkRateLimit(hwid)) {
+// ====== GUARD MIDDLEWARE ======
+function guard(req, res, next) {
+    const { hwid } = req.body;
+    if (!hwid) return res.json({ e: "bad" });
+    if (bannedHwids.has(hwid)) return res.json({ e: "banned" });
+    if (!checkRate(hwid)) {
         addStrike(hwid);
-        return res.json(makeSignedResponse({ ok: false, reason: "โง่:> spam เหรอ" }));
+        return res.json({ e: "rate" });
     }
-
-    // content-type check
-    if (!req.headers["content-type"]?.includes("application/json")) {
-        addStrike(hwid);
-        return res.json(makeSignedResponse({ ok: false, reason: "โง่:>" }));
-    }
-
-    // ห้ามมี header แปลกๆ ที่ httpspy มักใส่มา
-    const suspiciousHeaders = ["x-debug", "x-proxy", "x-forwarded-host", "via"];
-    for (const h of suspiciousHeaders) {
+    const suspicious = ["x-debug", "x-proxy", "via", "x-forwarded-host"];
+    for (const h of suspicious) {
         if (req.headers[h]) {
             addStrike(hwid);
-            return res.json(makeSignedResponse({ ok: false, reason: "โง่:>" }));
+            return res.json({ e: "bad" });
         }
     }
-
     next();
 }
 
-// ====== STEP 1: challenge ======
-app.post("/challenge", luaGuard, (req, res) => {
+// ====== STEP 1: init session ======
+// endpoint ชื่อแปลก ดูเหมือน Cloudflare
+app.post("/cdn-cgi/challenge", guard, (req, res) => {
     const { key, hwid, ts, nonce } = req.body;
-    if (!key || !hwid || !ts || !nonce)
-        return res.json(makeSignedResponse({ ok: false, reason: "โง่:>" }));
-
-    // timestamp window 10 วินาที
+    if (!key || !hwid || !ts || !nonce) return res.json({ e: "bad" });
     if (Math.abs(nowSec() - ts) > 10) {
         addStrike(hwid);
-        return res.json(makeSignedResponse({ ok: false, reason: "โง่:> ช้าเกิน" }));
+        return res.json({ e: "ts" });
     }
-
-    // nonce ต้องเป็น hex 32 chars
     if (!/^[a-f0-9]{32}$/.test(nonce)) {
         addStrike(hwid);
-        return res.json(makeSignedResponse({ ok: false, reason: "โง่:>" }));
+        return res.json({ e: "bad" });
     }
 
     const data = loadData();
     const keyData = data.keys[key];
-    if (!keyData) {
-        addStrike(hwid);
-        return res.json(makeSignedResponse({ ok: false, reason: "โง่:> key ผิด" }));
-    }
+    if (!keyData) { addStrike(hwid); return res.json({ e: "key" }); }
     if (isExpired(keyData)) {
         keyData.expired = true;
         saveData(data);
-        return res.json(makeSignedResponse({ ok: false, reason: "Key หมดอายุแล้ว" }));
+        return res.json({ e: "exp" });
     }
 
-    const challengeId = crypto.randomBytes(16).toString("hex");
+    const sessionId = crypto.randomBytes(16).toString("hex");
+    const sessionKey = crypto.randomBytes(32).toString("hex");
     const challenge = crypto.randomBytes(32).toString("hex");
 
-    challenges.set(challengeId, {
-        challenge, key, hwid, nonce,
-        expireAt: Date.now() + 15000  // 15 วินาทีเท่านั้น
+    sessions.set(sessionId, {
+        challenge, sessionKey, key, hwid, nonce,
+        expireAt: Date.now() + 15000
     });
 
-    res.json(makeSignedResponse({ ok: true, challengeId, challenge }));
+    // เข้ารหัส sessionKey ด้วย HMAC ของ hwid+nonce
+    const encKey = crypto.createHmac("sha256", SIGN_SECRET)
+        .update(`${hwid}:${nonce}:${ts}`)
+        .digest("hex");
+
+    res.json({
+        s: sessionId,
+        c: challenge,
+        k: encKey  // client ใช้ decrypt response step 2
+    });
 });
 
 // ====== STEP 2: verify ======
-app.post("/verify", luaGuard, (req, res) => {
-    const { challengeId, hwid, ts, answer } = req.body;
-    if (!challengeId || !hwid || !ts || !answer)
-        return res.json(makeSignedResponse({ ok: false, reason: "โง่:>" }));
-
-    // timestamp window 10 วินาที
+app.post("/cdn-cgi/token", guard, (req, res) => {
+    const { s, hwid, ts, nonce } = req.body;
+    if (!s || !hwid || !ts || !nonce) return res.json({ e: "bad" });
     if (Math.abs(nowSec() - ts) > 10) {
         addStrike(hwid);
-        return res.json(makeSignedResponse({ ok: false, reason: "โง่:> ช้าเกิน" }));
+        return res.json({ e: "ts" });
     }
-
-    if (usedChallenges.has(challengeId)) {
+    if (usedSessions.has(s)) {
         addStrike(hwid);
-        return res.json(makeSignedResponse({ ok: false, reason: "โง่:> replay" }));
+        return res.json({ e: "used" });
     }
 
-    const entry = challenges.get(challengeId);
-    if (!entry) {
+    const entry = sessions.get(s);
+    if (!entry) { addStrike(hwid); return res.json({ e: "sess" }); }
+    if (entry.hwid !== hwid || entry.nonce !== nonce) {
         addStrike(hwid);
-        return res.json(makeSignedResponse({ ok: false, reason: "โง่:> challenge หมดแล้ว" }));
+        return res.json({ e: "bad" });
     }
 
-    if (entry.hwid !== hwid) {
-        addStrike(hwid);
-        return res.json(makeSignedResponse({ ok: false, reason: "โง่:>" }));
-    }
-
-    // เช็ค answer = HMAC(challenge + nonce + hwid)
-    const expectedAnswer = crypto.createHmac("sha256", entry.challenge)
-        .update(`${entry.nonce}:${hwid}:${ts}`)
-        .digest("hex");
-    const expectedAnswerB64 = crypto.createHmac("sha256", entry.challenge)
-        .update(`${entry.nonce}:${hwid}:${ts}`)
-        .digest("base64");
-
-    if (answer !== expectedAnswer && answer !== expectedAnswerB64) {
-        addStrike(hwid);
-        return res.json(makeSignedResponse({ ok: false, reason: "โง่:> answer ผิด" }));
-    }
-
-    usedChallenges.add(challengeId);
-    challenges.delete(challengeId);
-    setTimeout(() => usedChallenges.delete(challengeId), 30000);
+    usedSessions.add(s);
+    sessions.delete(s);
+    setTimeout(() => usedSessions.delete(s), 30000);
 
     const data = loadData();
     const keyData = data.keys[entry.key];
-    if (!keyData) return res.json(makeSignedResponse({ ok: false, reason: "โง่:> key หาย" }));
+    if (!keyData) return res.json({ e: "key" });
     if (isExpired(keyData)) {
         keyData.expired = true;
         saveData(data);
-        return res.json(makeSignedResponse({ ok: false, reason: "Key หมดอายุแล้ว" }));
+        return res.json({ e: "exp" });
     }
 
     const hashedHwid = crypto.createHash("sha256").update(hwid).digest("hex");
     if (keyData.hwid && keyData.hwid !== "" && keyData.hwid !== hashedHwid) {
         addStrike(hwid);
-        return res.json(makeSignedResponse({ ok: false, reason: "reset hwid ก่อนน่ะโง่:>" }));
+        return res.json({ e: "hwid" });
     }
 
     if (!keyData.hwid || keyData.hwid === "") keyData.hwid = hashedHwid;
@@ -243,7 +208,14 @@ app.post("/verify", luaGuard, (req, res) => {
     keyData.executionCount = (keyData.executionCount || 0) + 1;
     saveData(data);
 
-    return res.json(makeSignedResponse({ ok: true, scriptUrl: data.config.scriptUrl || null }));
+    // เข้ารหัส response ด้วย sessionKey
+    const payload = {
+        ok: true,
+        scriptUrl: data.config.scriptUrl || null,
+        ts: nowSec()
+    };
+    const encrypted = encryptResponse(payload, entry.sessionKey);
+    res.json(encrypted);
 });
 
 // ====== BOT ENDPOINTS ======
@@ -251,7 +223,7 @@ app.post("/keys/generate", botAuth, (req, res) => {
     const { duration, amount } = req.body;
     const data = loadData();
     const keys = [];
-    for (let i = 0; i < (amount || 1); i++) {
+    for (let i = 0; i < Math.min(amount || 1, 50); i++) {
         const key = crypto.randomBytes(16).toString("hex");
         data.keys[key] = {
             active: false, expired: false, duration: duration ?? -1,
@@ -273,9 +245,9 @@ app.delete("/keys/:key", botAuth, (req, res) => {
 
 app.get("/keys/:key", botAuth, (req, res) => {
     const data = loadData();
-    const keyData = data.keys[req.params.key];
-    if (!keyData) return res.status(404).json({ ok: false });
-    res.json({ ok: true, key: req.params.key, data: keyData });
+    const kd = data.keys[req.params.key];
+    if (!kd) return res.status(404).json({ ok: false });
+    res.json({ ok: true, key: req.params.key, data: kd });
 });
 
 app.get("/keys", botAuth, (req, res) => {
@@ -285,10 +257,10 @@ app.get("/keys", botAuth, (req, res) => {
 
 app.post("/keys/:key/reset-hwid", botAuth, (req, res) => {
     const data = loadData();
-    const keyData = data.keys[req.params.key];
-    if (!keyData) return res.status(404).json({ ok: false });
-    keyData.hwid = "";
-    keyData.lastHwidReset = nowSec();
+    const kd = data.keys[req.params.key];
+    if (!kd) return res.status(404).json({ ok: false });
+    kd.hwid = "";
+    kd.lastHwidReset = nowSec();
     saveData(data);
     res.json({ ok: true });
 });
@@ -303,22 +275,21 @@ app.get("/keys/user/:userId", botAuth, (req, res) => {
 app.post("/keys/:key/redeem", botAuth, (req, res) => {
     const { userId } = req.body;
     const data = loadData();
-    const keyData = data.keys[req.params.key];
-    if (!keyData) return res.status(404).json({ ok: false, reason: "Key ไม่ถูกต้อง" });
-    if (isExpired(keyData)) {
-        keyData.expired = true;
-        saveData(data);
+    const kd = data.keys[req.params.key];
+    if (!kd) return res.status(404).json({ ok: false, reason: "Key ไม่ถูกต้อง" });
+    if (isExpired(kd)) {
+        kd.expired = true; saveData(data);
         return res.json({ ok: false, reason: "Key หมดอายุแล้ว" });
     }
-    if (keyData.usedBy && keyData.usedBy !== "" && keyData.usedBy !== userId)
+    if (kd.usedBy && kd.usedBy !== "" && kd.usedBy !== userId)
         return res.json({ ok: false, reason: "Key used by someone else" });
-    if (keyData.usedBy === userId)
+    if (kd.usedBy === userId)
         return res.json({ ok: false, reason: "Already redeemed" });
-    keyData.usedBy = userId;
-    keyData.active = true;
-    if (!keyData.redeemedAt || keyData.redeemedAt === 0) keyData.redeemedAt = nowSec();
+    kd.usedBy = userId;
+    kd.active = true;
+    if (!kd.redeemedAt || kd.redeemedAt === 0) kd.redeemedAt = nowSec();
     saveData(data);
-    res.json({ ok: true, duration: keyData.duration });
+    res.json({ ok: true, duration: kd.duration });
 });
 
 app.post("/config", botAuth, (req, res) => {
@@ -333,22 +304,18 @@ app.get("/config", botAuth, (req, res) => {
     res.json({ ok: true, config: data.config });
 });
 
-// ban/unban hwid
 app.post("/ban/:hwid", botAuth, (req, res) => {
     bannedHwids.add(req.params.hwid);
-    const data = loadData();
-    saveData(data);
+    const data = loadData(); saveData(data);
     res.json({ ok: true });
 });
 
 app.delete("/ban/:hwid", botAuth, (req, res) => {
     bannedHwids.delete(req.params.hwid);
-    suspiciousMap.delete(req.params.hwid);
-    const data = loadData();
-    saveData(data);
+    strikeMap.delete(req.params.hwid);
+    const data = loadData(); saveData(data);
     res.json({ ok: true });
 });
 
 app.get("/ping", (req, res) => res.send("pong"));
-
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
