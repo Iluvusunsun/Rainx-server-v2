@@ -11,14 +11,47 @@ const BOT_SECRET = process.env.BOT_SECRET || "rainx-bot-secret";
 const SIGN_SECRET = process.env.SIGN_SECRET || "rainx-sign-secret-xyz";
 const DATA_FILE = path.join(__dirname, "data.json");
 
+// ====== IN-MEMORY CACHE ======
+let _keys = {};
+let _config = {};
+let _dirty = false;
+
+function loadData() {
+    try {
+        if (!fs.existsSync(DATA_FILE)) {
+            fs.writeFileSync(DATA_FILE, JSON.stringify({ keys: {}, config: {} }));
+        }
+        const d = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+        _keys = d.keys || {};
+        _config = d.config || {};
+    } catch {
+        _keys = {};
+        _config = {};
+    }
+}
+
+function saveData() {
+    _dirty = false;
+    fs.writeFileSync(DATA_FILE, JSON.stringify({ keys: _keys, config: _config }, null, 2));
+}
+
+// auto-save ทุก 5 วิ ถ้ามีการเปลี่ยนแปลง
+setInterval(() => { if (_dirty) saveData(); }, 5000);
+
+// โหลดตอนเริ่ม
+loadData();
+
+// index userId -> key สำหรับ lookup เร็ว
+const userIndex = new Map();
+for (const [k, v] of Object.entries(_keys)) {
+    if (v.usedBy) userIndex.set(v.usedBy, k);
+}
+
 // ====== STORES ======
 const sessions = new Map();
 const usedSessions = new Set();
 const rateLimitMap = new Map();
-const activeTokens = new Map(); // hwid -> { token, expireAt } สำหรับ remote validation
-const fakeEndpointLog = new Map(); // log คนที่โดนหลอกไปใช้ fake endpoint
-
-const RATE_LIMIT = 8;
+const activeTokens = new Map();
 
 setInterval(() => {
     const now = Date.now();
@@ -34,19 +67,6 @@ setInterval(() => {
 }, 30000);
 
 // ====== HELPERS ======
-function loadData() {
-    try {
-        if (!fs.existsSync(DATA_FILE)) {
-            fs.writeFileSync(DATA_FILE, JSON.stringify({ keys: {}, config: {} }));
-        }
-        return JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-    } catch { return { keys: {}, config: {} }; }
-}
-
-function saveData(data) {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-}
-
 function nowSec() { return Math.floor(Date.now() / 1000); }
 
 function isExpired(k) {
@@ -56,7 +76,6 @@ function isExpired(k) {
     return nowSec() >= (k.redeemedAt + k.duration);
 }
 
-// เข้ารหัส AES-256-GCM
 function encrypt(data, keyHex) {
     const key = Buffer.from(keyHex.slice(0, 64), "hex");
     const iv = crypto.randomBytes(12);
@@ -68,18 +87,13 @@ function encrypt(data, keyHex) {
     return { d: enc, iv: iv.toString("base64"), t: tag };
 }
 
-function sign(data) {
-    return crypto.createHmac("sha256", SIGN_SECRET)
-        .update(JSON.stringify(data)).digest("hex");
-}
-
 function checkRate(hwid) {
     const now = Date.now();
     const e = rateLimitMap.get(hwid) || { count: 0, resetAt: now + 60000 };
     if (now > e.resetAt) { e.count = 0; e.resetAt = now + 60000; }
     e.count++;
     rateLimitMap.set(hwid, e);
-    return e.count <= RATE_LIMIT;
+    return e.count <= 8;
 }
 
 function botAuth(req, res, next) {
@@ -92,76 +106,45 @@ function guard(req, res, next) {
     const { hwid } = req.body;
     if (!hwid) return res.json({ e: "bad" });
     if (!checkRate(hwid)) return res.json({ e: "rate" });
-    const bad = ["x-debug", "x-proxy", "via", "x-forwarded-host"];
-    for (const h of bad) {
-        if (req.headers[h]) return res.json({ e: "bad" });
-    }
     next();
 }
 
-// ====== FAKE ENDPOINTS (หลอกคนดัก) ======
-// ดูเหมือน endpoint จริงแต่ส่ง garbage กลับ
+// ====== FAKE ENDPOINTS ======
 app.post("/api/v1/auth", (req, res) => {
-    const fakeKey = crypto.randomBytes(32).toString("hex");
-    const fakeToken = crypto.randomBytes(64).toString("base64");
-    fakeEndpointLog.set(req.body?.hwid || "unknown", Date.now());
-    res.json({
-        ok: true,
-        token: fakeToken,
-        session: fakeKey,
-        expires: nowSec() + 300,
-        scriptUrl: "https://pastefy.app/fake/raw"
-    });
+    res.json({ ok: true, token: crypto.randomBytes(32).toString("base64"), expires: nowSec() + 300 });
 });
-
 app.post("/api/v2/verify", (req, res) => {
-    fakeEndpointLog.set(req.body?.hwid || "unknown", Date.now());
-    res.json({
-        ok: true,
-        authorized: true,
-        hwid: req.body?.hwid,
-        key: req.body?.key
-    });
+    res.json({ ok: true, authorized: true });
 });
-
 app.post("/api/v3/check", (req, res) => {
-    fakeEndpointLog.set(req.body?.hwid || "unknown", Date.now());
-    const iv = crypto.randomBytes(12).toString("base64");
-    const d = crypto.randomBytes(64).toString("base64");
-    const t = crypto.randomBytes(16).toString("base64");
-    res.json({ d, iv, t, ok: true });
+    res.json({ d: crypto.randomBytes(64).toString("base64"), iv: crypto.randomBytes(12).toString("base64"), t: crypto.randomBytes(16).toString("base64"), ok: true });
 });
 
 // ====== REAL ENDPOINTS ======
-// ชื่อดูเหมือน CDN/static จะได้งงว่าอันไหนจริง
 app.post("/cdn-cgi/challenge", guard, (req, res) => {
     const { key, hwid, ts, nonce, fp } = req.body;
-    // fp = fingerprint หลายค่า concat กัน
     if (!key || !hwid || !ts || !nonce || !fp) return res.json({ e: "bad" });
     if (Math.abs(nowSec() - ts) > 10) return res.json({ e: "ts" });
     if (!/^[a-f0-9]{32}$/.test(nonce)) return res.json({ e: "bad" });
-    // fp ต้องยาวพอ (หลายค่า concat)
     if (fp.length < 32) return res.json({ e: "bad" });
 
-    const data = loadData();
-    const keyData = data.keys[key];
+    const keyData = _keys[key];
     if (!keyData) return res.json({ e: "key" });
     if (isExpired(keyData)) {
         keyData.expired = true;
-        saveData(data);
+        _dirty = true;
         return res.json({ e: "exp" });
     }
 
     const sessionId = crypto.randomBytes(16).toString("hex");
     const sessionKey = crypto.randomBytes(32).toString("hex");
-    const challenge = crypto.randomBytes(32).toString("hex");
 
     sessions.set(sessionId, {
-        challenge, sessionKey, key, hwid, nonce, fp,
+        sessionKey, key, hwid, nonce, fp,
         expireAt: Date.now() + 15000
     });
 
-    res.json({ s: sessionId, c: challenge, k: sessionKey });
+    res.json({ s: sessionId, k: sessionKey });
 });
 
 app.post("/cdn-cgi/token", guard, (req, res) => {
@@ -179,16 +162,14 @@ app.post("/cdn-cgi/token", guard, (req, res) => {
     sessions.delete(s);
     setTimeout(() => usedSessions.delete(s), 30000);
 
-    const data = loadData();
-    const keyData = data.keys[entry.key];
+    const keyData = _keys[entry.key];
     if (!keyData) return res.json({ e: "key" });
     if (isExpired(keyData)) {
         keyData.expired = true;
-        saveData(data);
+        _dirty = true;
         return res.json({ e: "exp" });
     }
 
-    // HWID เช็คแบบ hash
     const hashedHwid = crypto.createHash("sha256").update(hwid).digest("hex");
     if (keyData.hwid && keyData.hwid !== "" && keyData.hwid !== hashedHwid)
         return res.json({ e: "hwid" });
@@ -198,40 +179,32 @@ app.post("/cdn-cgi/token", guard, (req, res) => {
     keyData.active = true;
     keyData.expired = false;
     keyData.executionCount = (keyData.executionCount || 0) + 1;
-    saveData(data);
+    _dirty = true;
 
-    // สร้าง active token สำหรับ remote validation
     const activeToken = crypto.randomBytes(32).toString("hex");
     activeTokens.set(hwid, {
         token: activeToken,
         key: entry.key,
-        expireAt: Date.now() + 5 * 60 * 1000 // 5 นาที
+        expireAt: Date.now() + 5 * 60 * 1000
     });
 
-    // เข้ารหัส response + watermark key ลงไปด้วย
     const payload = {
         ok: true,
-        scriptUrl: data.config.scriptUrl || null,
+        scriptUrl: _config.scriptUrl || null,
         activeToken,
-        watermark: entry.key.slice(0, 8), // ฝัง key บางส่วนเป็น watermark
         ts: nowSec()
     };
 
-    const encrypted = encrypt(payload, entry.sessionKey);
-    res.json(encrypted);
+    res.json(encrypt(payload, entry.sessionKey));
 });
 
-// Remote validation endpoint — script เช็คทุก 30 วิ
 app.post("/cdn-cgi/heartbeat", guard, (req, res) => {
     const { hwid, token, ts } = req.body;
     if (!hwid || !token || !ts) return res.json({ alive: false });
     if (Math.abs(nowSec() - ts) > 15) return res.json({ alive: false });
-
     const entry = activeTokens.get(hwid);
     if (!entry || entry.token !== token || Date.now() > entry.expireAt)
         return res.json({ alive: false });
-
-    // ต่ออายุ token
     entry.expireAt = Date.now() + 5 * 60 * 1000;
     res.json({ alive: true });
 });
@@ -239,64 +212,60 @@ app.post("/cdn-cgi/heartbeat", guard, (req, res) => {
 // ====== BOT ENDPOINTS ======
 app.post("/keys/generate", botAuth, (req, res) => {
     const { duration, amount } = req.body;
-    const data = loadData();
     const keys = [];
     for (let i = 0; i < Math.min(amount || 1, 50); i++) {
         const key = crypto.randomBytes(16).toString("hex");
-        data.keys[key] = {
+        _keys[key] = {
             active: false, expired: false, duration: duration ?? -1,
             executionCount: 0, hwid: "", createdAt: nowSec(), redeemedAt: 0, lastHwidReset: 0
         };
         keys.push(key);
     }
-    saveData(data);
+    _dirty = true;
     res.json({ ok: true, keys });
 });
 
 app.delete("/keys/:key", botAuth, (req, res) => {
-    const data = loadData();
-    if (!data.keys[req.params.key]) return res.status(404).json({ ok: false });
-    delete data.keys[req.params.key];
-    saveData(data);
+    if (!_keys[req.params.key]) return res.status(404).json({ ok: false });
+    const kd = _keys[req.params.key];
+    if (kd.usedBy) userIndex.delete(kd.usedBy);
+    delete _keys[req.params.key];
+    _dirty = true;
     res.json({ ok: true });
 });
 
 app.get("/keys/:key", botAuth, (req, res) => {
-    const data = loadData();
-    const kd = data.keys[req.params.key];
+    const kd = _keys[req.params.key];
     if (!kd) return res.status(404).json({ ok: false });
     res.json({ ok: true, key: req.params.key, data: kd });
 });
 
 app.get("/keys", botAuth, (req, res) => {
-    const data = loadData();
-    res.json({ ok: true, keys: data.keys });
+    res.json({ ok: true, keys: _keys });
 });
 
 app.post("/keys/:key/reset-hwid", botAuth, (req, res) => {
-    const data = loadData();
-    const kd = data.keys[req.params.key];
+    const kd = _keys[req.params.key];
     if (!kd) return res.status(404).json({ ok: false });
     kd.hwid = "";
     kd.lastHwidReset = nowSec();
-    saveData(data);
+    _dirty = true;
     res.json({ ok: true });
 });
 
+// lookup เร็วด้วย userIndex
 app.get("/keys/user/:userId", botAuth, (req, res) => {
-    const data = loadData();
-    const entry = Object.entries(data.keys).find(([, v]) => v.usedBy === req.params.userId);
-    if (!entry) return res.status(404).json({ ok: false });
-    res.json({ ok: true, key: entry[0], data: entry[1] });
+    const key = userIndex.get(req.params.userId);
+    if (!key || !_keys[key]) return res.status(404).json({ ok: false });
+    res.json({ ok: true, key, data: _keys[key] });
 });
 
 app.post("/keys/:key/redeem", botAuth, (req, res) => {
     const { userId } = req.body;
-    const data = loadData();
-    const kd = data.keys[req.params.key];
+    const kd = _keys[req.params.key];
     if (!kd) return res.status(404).json({ ok: false, reason: "Key ไม่ถูกต้อง" });
     if (isExpired(kd)) {
-        kd.expired = true; saveData(data);
+        kd.expired = true; _dirty = true;
         return res.json({ ok: false, reason: "Key หมดอายุแล้ว" });
     }
     if (kd.usedBy && kd.usedBy !== "" && kd.usedBy !== userId)
@@ -306,20 +275,19 @@ app.post("/keys/:key/redeem", botAuth, (req, res) => {
     kd.usedBy = userId;
     kd.active = true;
     if (!kd.redeemedAt || kd.redeemedAt === 0) kd.redeemedAt = nowSec();
-    saveData(data);
+    userIndex.set(userId, req.params.key);
+    _dirty = true;
     res.json({ ok: true, duration: kd.duration });
 });
 
 app.post("/config", botAuth, (req, res) => {
-    const data = loadData();
-    data.config = { ...data.config, ...req.body };
-    saveData(data);
+    _config = { ..._config, ...req.body };
+    _dirty = true;
     res.json({ ok: true });
 });
 
 app.get("/config", botAuth, (req, res) => {
-    const data = loadData();
-    res.json({ ok: true, config: data.config });
+    res.json({ ok: true, config: _config });
 });
 
 app.get("/ping", (req, res) => res.send("pong"));
