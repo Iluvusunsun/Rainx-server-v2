@@ -52,6 +52,7 @@ const sessions = new Map();
 const usedSessions = new Set();
 const rateLimitMap = new Map();
 const activeTokens = new Map();
+const scriptTokens = new Map(); // one-time script tokens: token -> { userId, key, expireAt }
 
 setInterval(() => {
     const now = Date.now();
@@ -188,9 +189,17 @@ app.post("/cdn-cgi/token", guard, (req, res) => {
         expireAt: Date.now() + 5 * 60 * 1000
     });
 
+    // สร้าง one-time script token
+    const scriptToken = crypto.randomBytes(32).toString("hex");
+    scriptTokens.set(scriptToken, {
+        userId: keyData.usedBy,
+        key: entry.key,
+        expireAt: Date.now() + 60000 // หมดใน 60 วิ
+    });
+
     const payload = {
         ok: true,
-        scriptUrl: _config.scriptUrl || null,
+        scriptToken, // ใช้แทน scriptUrl โดยตรง
         activeToken,
         ts: nowSec()
     };
@@ -288,6 +297,35 @@ app.post("/config", botAuth, (req, res) => {
 
 app.get("/config", botAuth, (req, res) => {
     res.json({ ok: true, config: _config });
+});
+
+// one-time script endpoint
+app.get("/cdn-cgi/resource", (req, res) => {
+    const { t } = req.query;
+    if (!t) return res.status(403).send("forbidden");
+
+    const entry = scriptTokens.get(t);
+    if (!entry) return res.status(403).send("forbidden");
+    if (Date.now() > entry.expireAt) {
+        scriptTokens.delete(t);
+        return res.status(403).send("expired");
+    }
+
+    // ใช้แล้วลบทันที one-time only
+    scriptTokens.delete(t);
+
+    const scriptUrl = _config.scriptUrl;
+    if (!scriptUrl) return res.status(404).send("no script");
+
+    // ฝัง watermark - ถ้าเอาไปแจกรู้ทันทีว่าใคร
+    const watermark = `-- [RainX] Licensed to: ${entry.userId} | Key: ${entry.key.slice(0,8)}...
+-- Redistribution is prohibited.
+getgenv().key = "${entry.key}"
+getgenv()._owner = "${entry.userId}"
+loadstring(game:HttpGet("${scriptUrl}"))()`;
+
+    res.setHeader("Content-Type", "text/plain");
+    res.send(watermark);
 });
 
 app.get("/ping", (req, res) => res.send("pong"));
