@@ -140,8 +140,14 @@ app.post("/cdn-cgi/challenge", guard, (req, res) => {
     const sessionId = crypto.randomBytes(16).toString("hex");
     const sessionKey = crypto.randomBytes(32).toString("hex");
 
+    const clientIp = req.headers["x-forwarded-for"]?.split(",")[0].trim() || req.ip;
+    const hashedHwidChallenge = crypto.createHash("sha256").update(hwid).digest("hex");
+
     sessions.set(sessionId, {
-        sessionKey, key, hwid, nonce, fp,
+        sessionKey, key,
+        hwid: hashedHwidChallenge, // เก็บ hashed ไม่เก็บ raw
+        nonce, fp,
+        ip: clientIp,
         expireAt: Date.now() + 15000
     });
 
@@ -156,7 +162,12 @@ app.post("/cdn-cgi/token", guard, (req, res) => {
 
     const entry = sessions.get(s);
     if (!entry) return res.json({ e: "sess" });
-    if (entry.hwid !== hwid || entry.nonce !== nonce || entry.fp !== fp)
+
+    const reqIp = req.headers["x-forwarded-for"]?.split(",")[0].trim() || req.ip;
+    const hashedHwidToken = crypto.createHash("sha256").update(hwid).digest("hex");
+
+    // เช็ค IP ต้องตรงกับตอน challenge + hwid hashed ต้องตรง
+    if (entry.hwid !== hashedHwidToken || entry.nonce !== nonce || entry.fp !== fp || entry.ip !== reqIp)
         return res.json({ e: "bad" });
 
     usedSessions.add(s);
@@ -171,11 +182,11 @@ app.post("/cdn-cgi/token", guard, (req, res) => {
         return res.json({ e: "exp" });
     }
 
-    const hashedHwid = crypto.createHash("sha256").update(hwid).digest("hex");
-    if (keyData.hwid && keyData.hwid !== "" && keyData.hwid !== hashedHwid)
+    // ใช้ hashedHwidToken ที่คำนวณไว้แล้วด้านบน ไม่ต้อง hash ซ้ำ
+    if (keyData.hwid && keyData.hwid !== "" && keyData.hwid !== hashedHwidToken)
         return res.json({ e: "hwid" });
 
-    if (!keyData.hwid || keyData.hwid === "") keyData.hwid = hashedHwid;
+    if (!keyData.hwid || keyData.hwid === "") keyData.hwid = hashedHwidToken;
     if (!keyData.redeemedAt || keyData.redeemedAt === 0) keyData.redeemedAt = nowSec();
     keyData.active = true;
     keyData.expired = false;
@@ -183,7 +194,7 @@ app.post("/cdn-cgi/token", guard, (req, res) => {
     _dirty = true;
 
     const activeToken = crypto.randomBytes(32).toString("hex");
-    activeTokens.set(hwid, {
+    activeTokens.set(hashedHwidToken, {
         token: activeToken,
         key: entry.key,
         expireAt: Date.now() + 5 * 60 * 1000
@@ -211,7 +222,8 @@ app.post("/cdn-cgi/heartbeat", guard, (req, res) => {
     const { hwid, token, ts } = req.body;
     if (!hwid || !token || !ts) return res.json({ alive: false });
     if (Math.abs(nowSec() - ts) > 15) return res.json({ alive: false });
-    const entry = activeTokens.get(hwid);
+    const hashedHwid = crypto.createHash("sha256").update(hwid).digest("hex");
+    const entry = activeTokens.get(hashedHwid);
     if (!entry || entry.token !== token || Date.now() > entry.expireAt)
         return res.json({ alive: false });
     entry.expireAt = Date.now() + 5 * 60 * 1000;
