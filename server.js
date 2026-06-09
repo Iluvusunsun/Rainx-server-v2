@@ -9,39 +9,39 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const BOT_SECRET = process.env.BOT_SECRET || "rainx-bot-secret";
 const SIGN_SECRET = process.env.SIGN_SECRET || "rainx-sign-secret-xyz";
+const OWNER_SECRET = process.env.OWNER_SECRET || "owner-secret-123";
 const DATA_FILE = path.join(__dirname, "data.json");
 
 // ====== IN-MEMORY CACHE ======
 let _keys = {};
 let _config = {};
+let _guildLicenses = {}; // { guildId: { expiresAt, active, note, createdAt } }
 let _dirty = false;
 
 function loadData() {
     try {
         if (!fs.existsSync(DATA_FILE)) {
-            fs.writeFileSync(DATA_FILE, JSON.stringify({ keys: {}, config: {} }));
+            fs.writeFileSync(DATA_FILE, JSON.stringify({ keys: {}, config: {}, guildLicenses: {} }));
         }
         const d = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
         _keys = d.keys || {};
         _config = d.config || {};
+        _guildLicenses = d.guildLicenses || {};
     } catch {
         _keys = {};
         _config = {};
+        _guildLicenses = {};
     }
 }
 
 function saveData() {
     _dirty = false;
-    fs.writeFileSync(DATA_FILE, JSON.stringify({ keys: _keys, config: _config }, null, 2));
+    fs.writeFileSync(DATA_FILE, JSON.stringify({ keys: _keys, config: _config, guildLicenses: _guildLicenses }, null, 2));
 }
 
-// auto-save ทุก 5 วิ ถ้ามีการเปลี่ยนแปลง
 setInterval(() => { if (_dirty) saveData(); }, 5000);
-
-// โหลดตอนเริ่ม
 loadData();
 
-// index userId -> key สำหรับ lookup เร็ว
 const userIndex = new Map();
 for (const [k, v] of Object.entries(_keys)) {
     if (v.usedBy) userIndex.set(v.usedBy, k);
@@ -52,7 +52,6 @@ const sessions = new Map();
 const usedSessions = new Set();
 const rateLimitMap = new Map();
 const activeTokens = new Map();
-const scriptTokens = new Map(); // one-time script tokens: token -> { userId, key, expireAt }
 
 setInterval(() => {
     const now = Date.now();
@@ -77,6 +76,14 @@ function isExpired(k) {
     return nowSec() >= (k.redeemedAt + k.duration);
 }
 
+function isGuildExpired(guildId) {
+    const lic = _guildLicenses[guildId];
+    if (!lic) return true; // ไม่มี license = expired
+    if (!lic.active) return true;
+    if (lic.expiresAt === -1) return false; // ถาวร
+    return nowSec() >= lic.expiresAt;
+}
+
 function encrypt(data, keyHex) {
     const key = Buffer.from(keyHex.slice(0, 64), "hex");
     const iv = crypto.randomBytes(12);
@@ -99,6 +106,12 @@ function checkRate(hwid) {
 
 function botAuth(req, res, next) {
     if (req.headers["x-bot-secret"] !== BOT_SECRET)
+        return res.status(403).json({ error: "forbidden" });
+    next();
+}
+
+function ownerAuth(req, res, next) {
+    if (req.headers["x-owner-secret"] !== OWNER_SECRET)
         return res.status(403).json({ error: "forbidden" });
     next();
 }
@@ -139,13 +152,12 @@ app.post("/cdn-cgi/challenge", guard, (req, res) => {
 
     const sessionId = crypto.randomBytes(16).toString("hex");
     const sessionKey = crypto.randomBytes(32).toString("hex");
-
     const clientIp = req.headers["x-forwarded-for"]?.split(",")[0].trim() || req.ip;
     const hashedHwidChallenge = crypto.createHash("sha256").update(hwid).digest("hex");
 
     sessions.set(sessionId, {
         sessionKey, key,
-        hwid: hashedHwidChallenge, // เก็บ hashed ไม่เก็บ raw
+        hwid: hashedHwidChallenge,
         nonce, fp,
         ip: clientIp,
         expireAt: Date.now() + 15000
@@ -166,7 +178,6 @@ app.post("/cdn-cgi/token", guard, (req, res) => {
     const reqIp = req.headers["x-forwarded-for"]?.split(",")[0].trim() || req.ip;
     const hashedHwidToken = crypto.createHash("sha256").update(hwid).digest("hex");
 
-    // เช็ค IP ต้องตรงกับตอน challenge + hwid hashed ต้องตรง
     if (entry.hwid !== hashedHwidToken || entry.nonce !== nonce || entry.fp !== fp || entry.ip !== reqIp)
         return res.json({ e: "bad" });
 
@@ -182,7 +193,6 @@ app.post("/cdn-cgi/token", guard, (req, res) => {
         return res.json({ e: "exp" });
     }
 
-    // ใช้ hashedHwidToken ที่คำนวณไว้แล้วด้านบน ไม่ต้อง hash ซ้ำ
     if (keyData.hwid && keyData.hwid !== "" && keyData.hwid !== hashedHwidToken)
         return res.json({ e: "hwid" });
 
@@ -200,21 +210,7 @@ app.post("/cdn-cgi/token", guard, (req, res) => {
         expireAt: Date.now() + 5 * 60 * 1000
     });
 
-    // สร้าง one-time script token
-    const scriptToken = crypto.randomBytes(32).toString("hex");
-    scriptTokens.set(scriptToken, {
-        userId: keyData.usedBy,
-        key: entry.key,
-        expireAt: Date.now() + 60000 // หมดใน 60 วิ
-    });
-
-    const payload = {
-        ok: true,
-        scriptToken, // ใช้แทน scriptUrl โดยตรง
-        activeToken,
-        ts: nowSec()
-    };
-
+    const payload = { ok: true, activeToken, ts: nowSec() };
     res.json(encrypt(payload, entry.sessionKey));
 });
 
@@ -274,7 +270,6 @@ app.post("/keys/:key/reset-hwid", botAuth, (req, res) => {
     res.json({ ok: true });
 });
 
-// lookup เร็วด้วย userIndex
 app.get("/keys/user/:userId", botAuth, (req, res) => {
     const key = userIndex.get(req.params.userId);
     if (!key || !_keys[key]) return res.status(404).json({ ok: false });
@@ -311,33 +306,63 @@ app.get("/config", botAuth, (req, res) => {
     res.json({ ok: true, config: _config });
 });
 
-// one-time script endpoint
-app.get("/cdn-cgi/resource", (req, res) => {
-    const { t } = req.query;
-    if (!t) return res.status(403).send("forbidden");
+// ====== GUILD LICENSE ENDPOINTS ======
 
-    const entry = scriptTokens.get(t);
-    if (!entry) return res.status(403).send("forbidden");
-    if (Date.now() > entry.expireAt) {
-        scriptTokens.delete(t);
-        return res.status(403).send("expired");
-    }
+// เช็ค guild license (บอทเรียก)
+app.get("/guild/check/:guildId", botAuth, (req, res) => {
+    const guildId = req.params.guildId;
+    const expired = isGuildExpired(guildId);
+    const lic = _guildLicenses[guildId];
+    res.json({
+        ok: !expired,
+        expired,
+        expiresAt: lic?.expiresAt || null,
+        note: lic?.note || ""
+    });
+});
 
-    // ใช้แล้วลบทันที one-time only
-    scriptTokens.delete(t);
+// สร้าง/อัพเดท guild license (owner เรียก)
+app.post("/guild/license", ownerAuth, (req, res) => {
+    const { guildId, days, note } = req.body;
+    if (!guildId) return res.status(400).json({ ok: false, error: "no guildId" });
+    const duration = days === 0 ? -1 : (days || 30) * 86400;
+    const expiresAt = duration === -1 ? -1 : nowSec() + duration;
+    _guildLicenses[guildId] = {
+        guildId, expiresAt,
+        note: note || "",
+        active: true,
+        createdAt: nowSec()
+    };
+    _dirty = true;
+    res.json({ ok: true, guildId, expiresAt, days: days || 30 });
+});
 
-    const scriptUrl = _config.scriptUrl;
-    if (!scriptUrl) return res.status(404).send("no script");
+// ต่ออายุ guild license (owner เรียก)
+app.post("/guild/renew", ownerAuth, (req, res) => {
+    const { guildId, days } = req.body;
+    if (!guildId) return res.status(400).json({ ok: false, error: "no guildId" });
+    const lic = _guildLicenses[guildId];
+    if (!lic) return res.status(404).json({ ok: false, error: "not found" });
+    const addSec = (days || 30) * 86400;
+    const base = lic.expiresAt === -1 ? nowSec() : Math.max(lic.expiresAt, nowSec());
+    lic.expiresAt = base + addSec;
+    lic.active = true;
+    _dirty = true;
+    res.json({ ok: true, guildId, expiresAt: lic.expiresAt });
+});
 
-    // ฝัง watermark - ถ้าเอาไปแจกรู้ทันทีว่าใคร
-    const watermark = `-- [RainX] Licensed to: ${entry.userId} | Key: ${entry.key.slice(0,8)}...
--- Redistribution is prohibited.
-getgenv().key = "${entry.key}"
-getgenv()._owner = "${entry.userId}"
-loadstring(game:HttpGet("${scriptUrl}"))()`;
+// ลบ guild license (owner เรียก)
+app.delete("/guild/license/:guildId", ownerAuth, (req, res) => {
+    if (!_guildLicenses[req.params.guildId])
+        return res.status(404).json({ ok: false });
+    delete _guildLicenses[req.params.guildId];
+    _dirty = true;
+    res.json({ ok: true });
+});
 
-    res.setHeader("Content-Type", "text/plain");
-    res.send(watermark);
+// ดู guild licenses ทั้งหมด (owner เรียก)
+app.get("/guild/licenses", ownerAuth, (req, res) => {
+    res.json({ ok: true, licenses: _guildLicenses });
 });
 
 app.get("/ping", (req, res) => res.send("pong"));
