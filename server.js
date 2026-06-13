@@ -10,12 +10,13 @@ const PORT = process.env.PORT || 3000;
 const BOT_SECRET = process.env.BOT_SECRET || "rainx-bot-secret";
 const SIGN_SECRET = process.env.SIGN_SECRET || "rainx-sign-secret-xyz";
 const OWNER_SECRET = process.env.OWNER_SECRET || "owner-secret-123";
+const MAKURO_SECRET = process.env.MAKURO_SECRET || "makuro-secret-123";
 const DATA_FILE = path.join(__dirname, "data.json");
 
 // ====== IN-MEMORY CACHE ======
 let _keys = {};
 let _config = {};
-let _guildLicenses = {}; // { guildId: { expiresAt, active, note, createdAt } }
+let _guildLicenses = {};
 let _dirty = false;
 
 function loadData() {
@@ -78,9 +79,9 @@ function isExpired(k) {
 
 function isGuildExpired(guildId) {
     const lic = _guildLicenses[guildId];
-    if (!lic) return true; // ไม่มี license = expired
+    if (!lic) return true;
     if (!lic.active) return true;
-    if (lic.expiresAt === -1) return false; // ถาวร
+    if (lic.expiresAt === -1) return false;
     return nowSec() >= lic.expiresAt;
 }
 
@@ -113,6 +114,12 @@ function botAuth(req, res, next) {
 function ownerAuth(req, res, next) {
     if (req.headers["x-owner-secret"] !== OWNER_SECRET)
         return res.status(403).json({ error: "forbidden" });
+    next();
+}
+
+function makuroAuth(req, res, next) {
+    if (req.headers["x-makuro-secret"] !== MAKURO_SECRET)
+        return res.status(403).json({ ok: false, error: "forbidden" });
     next();
 }
 
@@ -207,6 +214,7 @@ app.post("/cdn-cgi/token", guard, (req, res) => {
     activeTokens.set(hashedHwidToken, {
         token: activeToken,
         key: entry.key,
+        hwid: hashedHwidToken,
         expireAt: Date.now() + 5 * 60 * 1000
     });
 
@@ -224,6 +232,46 @@ app.post("/cdn-cgi/heartbeat", guard, (req, res) => {
         return res.json({ alive: false });
     entry.expireAt = Date.now() + 5 * 60 * 1000;
     res.json({ alive: true });
+});
+
+// ====== NEW: 2-round auth validate (Client เรียก) ======
+app.post("/cdn-cgi/validate", (req, res) => {
+    const { token, hwid, h1, h2, ts } = req.body;
+    if (!token || !hwid || !h1 || !ts) return res.json({ ok: false });
+    if (Math.abs(nowSec() - ts) > 10) return res.json({ ok: false });
+
+    // หา token จาก activeTokens
+    const hashedHwid = crypto.createHash("sha256").update(hwid).digest("hex");
+    const entry = activeTokens.get(hashedHwid);
+    if (!entry || entry.token !== token || Date.now() > entry.expireAt)
+        return res.json({ ok: false });
+
+    // สร้าง seed แบบ random แล้วส่ง check กลับ
+    const seed = crypto.randomBytes(4).readUInt32BE(0) % 99999;
+    const h1Num = parseInt(h1) || 0;
+    // check = customHash(h1 + seed) — ทำ simple version ฝั่ง JS
+    const check = String(((h1Num + seed) * 31337 + 8410) % 99999999999);
+
+    res.json({ ok: true, seed, check });
+});
+
+// ====== NEW: Makuro token validation ======
+// Makuro server เรียก endpoint นี้เพื่อเช็คว่า token valid ไหมก่อนส่ง raw content
+app.post("/cdn-cgi/validate-token", makuroAuth, (req, res) => {
+    const { token } = req.body;
+    if (!token) return res.json({ ok: false });
+
+    // หา token จาก activeTokens ทั้งหมด
+    for (const [hwid, entry] of activeTokens.entries()) {
+        if (entry.token === token) {
+            if (Date.now() > entry.expireAt) {
+                activeTokens.delete(hwid);
+                return res.json({ ok: false, reason: "expired" });
+            }
+            return res.json({ ok: true });
+        }
+    }
+    return res.json({ ok: false, reason: "invalid" });
 });
 
 // ====== BOT ENDPOINTS ======
@@ -307,8 +355,6 @@ app.get("/config", botAuth, (req, res) => {
 });
 
 // ====== GUILD LICENSE ENDPOINTS ======
-
-// เช็ค guild license (บอทเรียก)
 app.get("/guild/check/:guildId", botAuth, (req, res) => {
     const guildId = req.params.guildId;
     const expired = isGuildExpired(guildId);
@@ -321,7 +367,6 @@ app.get("/guild/check/:guildId", botAuth, (req, res) => {
     });
 });
 
-// สร้าง/อัพเดท guild license (owner เรียก)
 app.post("/guild/license", ownerAuth, (req, res) => {
     const { guildId, days, note } = req.body;
     if (!guildId) return res.status(400).json({ ok: false, error: "no guildId" });
@@ -337,7 +382,6 @@ app.post("/guild/license", ownerAuth, (req, res) => {
     res.json({ ok: true, guildId, expiresAt, days: days || 30 });
 });
 
-// ต่ออายุ guild license (owner เรียก)
 app.post("/guild/renew", ownerAuth, (req, res) => {
     const { guildId, days } = req.body;
     if (!guildId) return res.status(400).json({ ok: false, error: "no guildId" });
@@ -351,7 +395,6 @@ app.post("/guild/renew", ownerAuth, (req, res) => {
     res.json({ ok: true, guildId, expiresAt: lic.expiresAt });
 });
 
-// ลบ guild license (owner เรียก)
 app.delete("/guild/license/:guildId", ownerAuth, (req, res) => {
     if (!_guildLicenses[req.params.guildId])
         return res.status(404).json({ ok: false });
@@ -360,7 +403,6 @@ app.delete("/guild/license/:guildId", ownerAuth, (req, res) => {
     res.json({ ok: true });
 });
 
-// ดู guild licenses ทั้งหมด (owner เรียก)
 app.get("/guild/licenses", ownerAuth, (req, res) => {
     res.json({ ok: true, licenses: _guildLicenses });
 });
