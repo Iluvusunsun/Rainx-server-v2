@@ -143,11 +143,12 @@ app.post("/api/v3/check", (req, res) => {
 
 // ====== REAL ENDPOINTS ======
 app.post("/cdn-cgi/challenge", guard, (req, res) => {
-    const { key, hwid, ts, nonce, fp } = req.body;
-    if (!key || !hwid || !ts || !nonce || !fp) return res.json({ e: "bad" });
+    const { key, hwid, ts, nonce } = req.body;
+    if (!key || !hwid || !ts || !nonce) return res.json({ e: "bad" });
     if (Math.abs(nowSec() - ts) > 10) return res.json({ e: "ts" });
     if (!/^[a-f0-9]{32}$/.test(nonce)) return res.json({ e: "bad" });
-    if (fp.length < 32) return res.json({ e: "bad" });
+    // HWID ต้องมีความยาวสมเหตุสมผล
+    if (typeof hwid !== "string" || hwid.length < 8 || hwid.length > 128) return res.json({ e: "bad" });
 
     const keyData = _keys[key];
     if (!keyData) return res.json({ e: "key" });
@@ -160,12 +161,18 @@ app.post("/cdn-cgi/challenge", guard, (req, res) => {
     const sessionId = crypto.randomBytes(16).toString("hex");
     const sessionKey = crypto.randomBytes(32).toString("hex");
     const clientIp = req.headers["x-forwarded-for"]?.split(",")[0].trim() || req.ip;
-    const hashedHwidChallenge = crypto.createHash("sha256").update(hwid).digest("hex");
+
+    // Server hash HWID เอง ไม่เชื่อ fp จาก client
+    const hashedHwid = crypto.createHash("sha256").update(hwid + SIGN_SECRET).digest("hex");
+
+    // สร้าง server-side fp เอง จาก HWID + IP + nonce
+    const serverFp = crypto.createHash("sha256").update(hwid + clientIp + nonce + SIGN_SECRET).digest("hex");
 
     sessions.set(sessionId, {
         sessionKey, key,
-        hwid: hashedHwidChallenge,
-        nonce, fp,
+        hwid: hashedHwid,
+        serverFp,
+        nonce,
         ip: clientIp,
         expireAt: Date.now() + 15000
     });
@@ -174,8 +181,8 @@ app.post("/cdn-cgi/challenge", guard, (req, res) => {
 });
 
 app.post("/cdn-cgi/token", guard, (req, res) => {
-    const { s, hwid, ts, nonce, fp } = req.body;
-    if (!s || !hwid || !ts || !nonce || !fp) return res.json({ e: "bad" });
+    const { s, hwid, ts, nonce } = req.body;
+    if (!s || !hwid || !ts || !nonce) return res.json({ e: "bad" });
     if (Math.abs(nowSec() - ts) > 10) return res.json({ e: "ts" });
     if (usedSessions.has(s)) return res.json({ e: "used" });
 
@@ -183,9 +190,14 @@ app.post("/cdn-cgi/token", guard, (req, res) => {
     if (!entry) return res.json({ e: "sess" });
 
     const reqIp = req.headers["x-forwarded-for"]?.split(",")[0].trim() || req.ip;
-    const hashedHwidToken = crypto.createHash("sha256").update(hwid).digest("hex");
 
-    if (entry.hwid !== hashedHwidToken || entry.nonce !== nonce || entry.fp !== fp || entry.ip !== reqIp)
+    // Server hash HWID เอง แล้วเทียบกับที่เก็บไว้ตอน challenge
+    const hashedHwidToken = crypto.createHash("sha256").update(hwid + SIGN_SECRET).digest("hex");
+
+    // เช็ค HWID hash, nonce, IP ต้องตรง — ไม่เชื่อ fp จาก client
+    const expectedFp = crypto.createHash("sha256").update(hwid + reqIp + nonce + SIGN_SECRET).digest("hex");
+
+    if (entry.hwid !== hashedHwidToken || entry.nonce !== nonce || entry.ip !== reqIp || entry.serverFp !== expectedFp)
         return res.json({ e: "bad" });
 
     usedSessions.add(s);
@@ -226,7 +238,8 @@ app.post("/cdn-cgi/heartbeat", guard, (req, res) => {
     const { hwid, token, ts } = req.body;
     if (!hwid || !token || !ts) return res.json({ alive: false });
     if (Math.abs(nowSec() - ts) > 15) return res.json({ alive: false });
-    const hashedHwid = crypto.createHash("sha256").update(hwid).digest("hex");
+    // Server hash HWID เอง ไม่เชื่อ client
+    const hashedHwid = crypto.createHash("sha256").update(hwid + SIGN_SECRET).digest("hex");
     const entry = activeTokens.get(hashedHwid);
     if (!entry || entry.token !== token || Date.now() > entry.expireAt)
         return res.json({ alive: false });
