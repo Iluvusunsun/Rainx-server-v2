@@ -295,7 +295,8 @@ app.post("/keys/generate", botAuth, (req, res) => {
         const key = crypto.randomBytes(16).toString("hex");
         _keys[key] = {
             active: false, expired: false, duration: duration ?? -1,
-            executionCount: 0, hwid: "", createdAt: nowSec(), redeemedAt: 0, lastHwidReset: 0
+            executionCount: 0, hwid: "", guildId: "",
+            createdAt: nowSec(), redeemedAt: 0, lastHwidReset: 0
         };
         keys.push(key);
     }
@@ -338,7 +339,7 @@ app.get("/keys/user/:userId", botAuth, (req, res) => {
 });
 
 app.post("/keys/:key/redeem", botAuth, (req, res) => {
-    const { userId } = req.body;
+    const { userId, guildId } = req.body;
     const kd = _keys[req.params.key];
     if (!kd) return res.status(404).json({ ok: false, reason: "Key ไม่ถูกต้อง" });
     if (isExpired(kd)) {
@@ -349,7 +350,11 @@ app.post("/keys/:key/redeem", botAuth, (req, res) => {
         return res.json({ ok: false, reason: "Key used by someone else" });
     if (kd.usedBy === userId)
         return res.json({ ok: false, reason: "Already redeemed" });
+    // เช็ค guild lock - ถ้า key ถูก redeem ใน guild อื่นแล้วห้ามใช้
+    if (kd.guildId && kd.guildId !== "" && guildId && kd.guildId !== guildId)
+        return res.json({ ok: false, reason: "Key used in another guild" });
     kd.usedBy = userId;
+    kd.guildId = guildId || "";
     kd.active = true;
     if (!kd.redeemedAt || kd.redeemedAt === 0) kd.redeemedAt = nowSec();
     userIndex.set(userId, req.params.key);
