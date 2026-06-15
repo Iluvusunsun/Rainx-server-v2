@@ -45,7 +45,10 @@ loadData();
 
 const userIndex = new Map();
 for (const [k, v] of Object.entries(_keys)) {
-    if (v.usedBy) userIndex.set(v.usedBy, k);
+    if (v.usedBy) {
+        const idxKey = v.guildId ? `${v.usedBy}:${v.guildId}` : v.usedBy;
+        userIndex.set(idxKey, k);
+    }
 }
 
 // ====== STORES ======
@@ -289,13 +292,14 @@ app.post("/cdn-cgi/validate-token", makuroAuth, (req, res) => {
 
 // ====== BOT ENDPOINTS ======
 app.post("/keys/generate", botAuth, (req, res) => {
-    const { duration, amount } = req.body;
+    const { duration, amount, file } = req.body;
     const keys = [];
     for (let i = 0; i < Math.min(amount || 1, 50); i++) {
         const key = crypto.randomBytes(16).toString("hex");
         _keys[key] = {
             active: false, expired: false, duration: duration ?? -1,
             executionCount: 0, hwid: "", guildId: "",
+            file: file || null, // null = ใช้ได้ทุกไฟล์
             createdAt: nowSec(), redeemedAt: 0, lastHwidReset: 0
         };
         keys.push(key);
@@ -307,7 +311,11 @@ app.post("/keys/generate", botAuth, (req, res) => {
 app.delete("/keys/:key", botAuth, (req, res) => {
     if (!_keys[req.params.key]) return res.status(404).json({ ok: false });
     const kd = _keys[req.params.key];
-    if (kd.usedBy) userIndex.delete(kd.usedBy);
+    if (kd.usedBy) {
+        const idxKey = kd.guildId ? `${kd.usedBy}:${kd.guildId}` : kd.usedBy;
+        userIndex.delete(idxKey);
+        userIndex.delete(kd.usedBy); // clean เผื่อ
+    }
     delete _keys[req.params.key];
     _dirty = true;
     res.json({ ok: true });
@@ -333,7 +341,11 @@ app.post("/keys/:key/reset-hwid", botAuth, (req, res) => {
 });
 
 app.get("/keys/user/:userId", botAuth, (req, res) => {
-    const key = userIndex.get(req.params.userId);
+    const guildId = req.query.guildId;
+    const idxKey = guildId ? `${req.params.userId}:${guildId}` : req.params.userId;
+    // ลอง guildId ก่อน ถ้าไม่เจอลอง userId เดี่ยว
+    let key = userIndex.get(idxKey);
+    if (!key && guildId) key = userIndex.get(req.params.userId);
     if (!key || !_keys[key]) return res.status(404).json({ ok: false });
     res.json({ ok: true, key, data: _keys[key] });
 });
@@ -357,9 +369,10 @@ app.post("/keys/:key/redeem", botAuth, (req, res) => {
     kd.guildId = guildId || "";
     kd.active = true;
     if (!kd.redeemedAt || kd.redeemedAt === 0) kd.redeemedAt = nowSec();
-    userIndex.set(userId, req.params.key);
+    const idxKey = guildId ? `${userId}:${guildId}` : userId;
+    userIndex.set(idxKey, req.params.key);
     _dirty = true;
-    res.json({ ok: true, duration: kd.duration });
+    res.json({ ok: true, duration: kd.duration, file: kd.file || null });
 });
 
 app.post("/config", botAuth, (req, res) => {
