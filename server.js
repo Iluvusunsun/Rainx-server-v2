@@ -343,12 +343,32 @@ app.post("/keys/:key/reset-hwid", botAuth, (req, res) => {
 app.get("/keys/user/:userId", botAuth, (req, res) => {
     const guildId = req.query.guildId || "";
     const file = req.query.file || "";
-    // ลอง exact match ก่อน: userId:guildId:file
-    let key = userIndex.get(`${req.params.userId}:${guildId}:${file}`);
-    // ถ้าไม่เจอ ลอง userId:guildId: (key ไม่ผูก file)
-    if (!key) key = userIndex.get(`${req.params.userId}:${guildId}:`);
-    // ถ้าไม่เจออีก ลอง userId:: (key ไม่ผูก guild และ file)
-    if (!key) key = userIndex.get(`${req.params.userId}::`);
+    const uid = req.params.userId;
+
+    // ลอง fallback หลายชั้น
+    const attempts = [
+        `${uid}:${guildId}:${file}`,  // exact match
+        `${uid}:${guildId}:`,          // same guild, no file lock
+        `${uid}::${file}`,             // any guild, same file
+        `${uid}::`,                    // any guild, no file lock
+    ];
+
+    let key = null;
+    for (const attempt of attempts) {
+        const k = userIndex.get(attempt);
+        if (k && _keys[k]) { key = k; break; }
+    }
+
+    // ถ้ายังไม่เจอ scan ทั้งหมด (กรณี legacy data)
+    if (!key) {
+        for (const [k, v] of Object.entries(_keys)) {
+            if (v.usedBy === uid && (!guildId || !v.guildId || v.guildId === guildId)) {
+                key = k;
+                break;
+            }
+        }
+    }
+
     if (!key || !_keys[key]) return res.status(404).json({ ok: false });
     res.json({ ok: true, key, data: _keys[key] });
 });
