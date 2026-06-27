@@ -1,7 +1,6 @@
 const express = require("express");
 const { PrismaClient } = require("@prisma/client");
 const crypto = require("crypto");
-const path = require("path");
 
 const prisma = new PrismaClient();
 const app = express();
@@ -39,7 +38,7 @@ app.use((req, res, next) => {
     next();
 });
 
-// ====== STORES ======
+// ====== IN-MEMORY STORES ======
 const sessions = new Map();
 const usedSessions = new Set();
 const rateLimitMap = new Map();
@@ -50,8 +49,8 @@ const suspiciousLog = new Map();
 setInterval(() => {
     const now = Date.now();
     for (const [id, val] of sessions.entries()) if (now > val.expireAt) sessions.delete(id);
-    for (const [hwid, val] of rateLimitMap.entries()) if (now > val.resetAt) rateLimitMap.delete(hwid);
-    for (const [hwid, val] of activeTokens.entries()) if (now > val.expireAt) activeTokens.delete(hwid);
+    for (const [h, val] of rateLimitMap.entries()) if (now > val.resetAt) rateLimitMap.delete(h);
+    for (const [h, val] of activeTokens.entries()) if (now > val.expireAt) activeTokens.delete(h);
     for (const [ip, val] of ipRateMap.entries()) if (now > val.resetAt) ipRateMap.delete(ip);
 }, 30000);
 
@@ -65,7 +64,7 @@ setInterval(async () => {
         });
         for (const k of keys) {
             if (nowSec() >= k.redeemedAt + k.duration) {
-                await prisma.key.update({ where: { key: k.key }, data: { expired: true } });
+                await prisma.key.update({ where: { key: k.key }, data: { expired: true } }).catch(() => {});
             }
         }
     } catch {}
@@ -89,12 +88,6 @@ function encrypt(data, keyHex) {
     const tag = cipher.getAuthTag().toString("base64");
     return { d: enc, iv: iv.toString("base64"), t: tag };
 }
-function verifyHmac(payload, signature, secret) {
-    if (!payload || !signature) return false;
-    const expected = crypto.createHmac("sha256", secret).update(payload).digest("hex");
-    try { return crypto.timingSafeEqual(Buffer.from(signature, "hex"), Buffer.from(expected, "hex")); }
-    catch { return false; }
-}
 function checkRate(hwid) {
     const now = Date.now();
     const e = rateLimitMap.get(hwid) || { count: 0, resetAt: now + 60000 };
@@ -110,7 +103,6 @@ function logSuspicious(ip, reason) {
     suspiciousLog.set(ip, entry);
     if (entry.count >= 5) console.warn(`[SUSPICIOUS] IP: ${ip} | Count: ${entry.count} | Reasons: ${entry.reasons.slice(-3).join(", ")}`);
 }
-
 function isExpiredData(k) {
     if (k.duration === -1) return false;
     if (k.expired) return true;
@@ -121,6 +113,15 @@ function isGuildExpiredData(lic) {
     if (!lic || !lic.active) return true;
     if (lic.expiresAt === -1) return false;
     return nowSec() >= lic.expiresAt;
+}
+async function getGuildConfig(guildId) {
+    let cfg = await prisma.guildConfig.findUnique({ where: { guildId } }).catch(() => null);
+    if (!cfg) {
+        cfg = await prisma.guildConfig.create({
+            data: { guildId, projectName: "Hub", bgUrl: "", setupUser: "System", adminRoleId: "", scripts: "{}" }
+        }).catch(() => null);
+    }
+    return cfg;
 }
 
 // ====== AUTH MIDDLEWARE ======
@@ -151,7 +152,7 @@ app.post("/api/v4/session", (req, res) => res.json({ ok: true, session: crypto.r
 app.post("/api/v5/ping", (req, res) => res.json({ pong: true, ts: nowSec() }));
 app.get("/api/status", (req, res) => res.json({ status: "ok", uptime: process.uptime() }));
 
-// ====== REAL ENDPOINTS ======
+// ====== AUTH ENDPOINTS ======
 app.post("/cdn-cgi/challenge", guard, async (req, res) => {
     const { key, hwid, ts, nonce } = req.body;
     if (!key || !hwid || !ts || !nonce) return res.json({ e: "bad" });
@@ -160,7 +161,6 @@ app.post("/cdn-cgi/challenge", guard, async (req, res) => {
     if (typeof hwid !== "string" || hwid.length < 8 || hwid.length > 128) return res.json({ e: "bad" });
 
     const clientIp = req.headers["x-forwarded-for"]?.split(",")[0].trim() || req.ip;
-
     if (usedNonces.has(nonce)) { logSuspicious(clientIp, "replay_nonce"); return res.json({ e: "replay" }); }
     usedNonces.add(nonce);
 
@@ -237,11 +237,9 @@ app.post("/cdn-cgi/heartbeat", guard, (req, res) => {
     const { hwid, token, ts, ping } = req.body;
     if (!hwid || !token || !ts) return res.json({ alive: false });
     if (Math.abs(nowSec() - ts) > 15) return res.json({ alive: false });
-
     const hashedHwid = hashHwid(hwid);
     const entry = activeTokens.get(hashedHwid);
     if (!entry || entry.token !== token || Date.now() > entry.expireAt) return res.json({ alive: false });
-
     entry.expireAt = Date.now() + 5 * 60 * 1000;
     const seed = Math.floor(Math.random() * 99999);
     const responseCheck = String(((parseInt(ping) || 0) + seed) * 31337 + 8410) % 99999999999;
@@ -256,8 +254,7 @@ app.post("/cdn-cgi/validate", (req, res) => {
     const entry = activeTokens.get(hashedHwid);
     if (!entry || entry.token !== token || Date.now() > entry.expireAt) return res.json({ ok: false });
     const seed = crypto.randomBytes(4).readUInt32BE(0) % 99999;
-    const h1Num = parseInt(h1) || 0;
-    const check = String(((h1Num + seed) * 31337 + 8410) % 99999999999);
+    const check = String(((parseInt(h1) || 0 + seed) * 31337 + 8410) % 99999999999);
     res.json({ ok: true, seed, check });
 });
 
@@ -273,14 +270,15 @@ app.post("/cdn-cgi/validate-token", makuroAuth, (req, res) => {
     return res.json({ ok: false, reason: "invalid" });
 });
 
-// ====== BOT ENDPOINTS ======
+// ====== KEY ENDPOINTS (per guild) ======
 app.post("/keys/generate", botAuth, async (req, res) => {
-    const { duration, amount, file } = req.body;
+    const { duration, amount, guildId } = req.body;
+    if (!guildId) return res.status(400).json({ ok: false, error: "no guildId" });
     const keys = [];
     for (let i = 0; i < Math.min(amount || 1, 50); i++) {
         const key = crypto.randomBytes(16).toString("hex");
         await prisma.key.create({
-            data: { key, active: false, expired: false, duration: duration ?? -1, executionCount: 0, hwid: "", guildId: "", file: file || null, createdAt: nowSec(), redeemedAt: 0, lastHwidReset: 0 }
+            data: { key, active: false, expired: false, duration: duration ?? -1, executionCount: 0, hwid: "", guildId, file: null, createdAt: nowSec(), redeemedAt: 0, lastHwidReset: 0 }
         }).catch(() => {});
         keys.push(key);
     }
@@ -299,8 +297,11 @@ app.get("/keys/:key", botAuth, async (req, res) => {
     res.json({ ok: true, key: req.params.key, data: kd });
 });
 
+// get all keys ของ guild นั้น
 app.get("/keys", botAuth, async (req, res) => {
-    const keys = await prisma.key.findMany().catch(() => []);
+    const { guildId } = req.query;
+    if (!guildId) return res.status(400).json({ ok: false, error: "no guildId" });
+    const keys = await prisma.key.findMany({ where: { guildId } }).catch(() => []);
     const keysObj = {};
     keys.forEach(k => { keysObj[k.key] = k; });
     res.json({ ok: true, keys: keysObj });
@@ -313,48 +314,70 @@ app.post("/keys/:key/reset-hwid", botAuth, async (req, res) => {
 });
 
 app.get("/keys/user/:userId", botAuth, async (req, res) => {
-    const { guildId = "", file = "" } = req.query;
-    const uid = req.params.userId;
-    let kd = await prisma.key.findFirst({ where: { usedBy: uid, ...(guildId ? { guildId } : {}) } }).catch(() => null);
+    const { guildId } = req.query;
+    if (!guildId) return res.status(400).json({ ok: false, error: "no guildId" });
+    const kd = await prisma.key.findFirst({ where: { usedBy: req.params.userId, guildId } }).catch(() => null);
     if (!kd) return res.status(404).json({ ok: false });
     res.json({ ok: true, key: kd.key, data: kd });
 });
 
 app.post("/keys/:key/redeem", botAuth, async (req, res) => {
     const { userId, guildId } = req.body;
+    if (!guildId) return res.status(400).json({ ok: false, reason: "no guildId" });
     const kd = await prisma.key.findUnique({ where: { key: req.params.key } }).catch(() => null);
     if (!kd) return res.status(404).json({ ok: false, reason: "Key ไม่ถูกต้อง" });
+    // เช็คว่า key ของ guild นี้
+    if (kd.guildId && kd.guildId !== "" && kd.guildId !== guildId)
+        return res.json({ ok: false, reason: "Key นี้ไม่ใช่ของ Server นี้" });
     if (isExpiredData(kd)) {
         await prisma.key.update({ where: { key: req.params.key }, data: { expired: true } }).catch(() => {});
         return res.json({ ok: false, reason: "Key หมดอายุแล้ว" });
     }
-    if (kd.usedBy && kd.usedBy !== "" && kd.usedBy !== userId) return res.json({ ok: false, reason: "Key used by someone else" });
-    if (kd.usedBy === userId) return res.json({ ok: false, reason: "Already redeemed" });
-    if (kd.guildId && kd.guildId !== "" && guildId && kd.guildId !== guildId) return res.json({ ok: false, reason: "Key used in another guild" });
+    if (kd.usedBy && kd.usedBy !== "" && kd.usedBy !== userId)
+        return res.json({ ok: false, reason: "Key used by someone else" });
+    if (kd.usedBy === userId)
+        return res.json({ ok: false, reason: "Already redeemed" });
     await prisma.key.update({
         where: { key: req.params.key },
-        data: { usedBy: userId, guildId: guildId || "", active: true, redeemedAt: kd.redeemedAt === 0 ? nowSec() : kd.redeemedAt }
+        data: { usedBy: userId, guildId, active: true, redeemedAt: kd.redeemedAt === 0 ? nowSec() : kd.redeemedAt }
     }).catch(() => {});
     res.json({ ok: true, duration: kd.duration, file: kd.file || null });
 });
 
-app.post("/config", botAuth, async (req, res) => {
-    const { key, ...rest } = req.body;
-    for (const [k, v] of Object.entries(req.body)) {
-        await prisma.config.upsert({
-            where: { key: k },
-            create: { key: k, value: JSON.stringify(v) },
-            update: { value: JSON.stringify(v) }
-        }).catch(() => {});
-    }
-    res.json({ ok: true });
+// ====== GUILD CONFIG ENDPOINTS (per guild) ======
+app.get("/config/:guildId", botAuth, async (req, res) => {
+    const cfg = await getGuildConfig(req.params.guildId);
+    if (!cfg) return res.status(500).json({ ok: false });
+    res.json({
+        ok: true,
+        config: {
+            projectName: cfg.projectName,
+            bgUrl: cfg.bgUrl,
+            setupUser: cfg.setupUser,
+            adminRoleId: cfg.adminRoleId,
+            hwidResetCooldownHours: cfg.hwidResetCooldownHours,
+            scripts: JSON.parse(cfg.scripts || "{}")
+        }
+    });
 });
 
-app.get("/config", botAuth, async (req, res) => {
-    const rows = await prisma.config.findMany().catch(() => []);
-    const config = {};
-    rows.forEach(r => { try { config[r.key] = JSON.parse(r.value); } catch { config[r.key] = r.value; } });
-    res.json({ ok: true, config });
+app.post("/config/:guildId", botAuth, async (req, res) => {
+    const guildId = req.params.guildId;
+    const { projectName, bgUrl, setupUser, adminRoleId, hwidResetCooldownHours, scripts } = req.body;
+    const data = {};
+    if (projectName !== undefined) data.projectName = projectName;
+    if (bgUrl !== undefined) data.bgUrl = bgUrl;
+    if (setupUser !== undefined) data.setupUser = setupUser;
+    if (adminRoleId !== undefined) data.adminRoleId = adminRoleId;
+    if (hwidResetCooldownHours !== undefined) data.hwidResetCooldownHours = hwidResetCooldownHours;
+    if (scripts !== undefined) data.scripts = JSON.stringify(scripts);
+
+    await prisma.guildConfig.upsert({
+        where: { guildId },
+        create: { guildId, projectName: "Hub", bgUrl: "", setupUser: "System", adminRoleId: "", scripts: "{}", ...data },
+        update: data
+    }).catch(() => {});
+    res.json({ ok: true });
 });
 
 // ====== GUILD LICENSE ENDPOINTS ======
