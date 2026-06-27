@@ -1,0 +1,45 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Key {
+  key            String   @id
+  active         Boolean  @default(false)
+  expired        Boolean  @default(false)
+  duration       Int      @default(-1)
+  executionCount Int      @default(0)
+  hwid           String   @default("")
+  guildId        String   @default("")
+  file           String?
+  usedBy         String?
+  createdAt      Int      @default(0)
+  redeemedAt     Int      @default(0)
+  lastHwidReset  Int      @default(0)
+
+  @@index([guildId])
+  @@index([usedBy, guildId])
+}
+
+model GuildConfig {
+  id          String  @id @default(cuid())
+  guildId     String  @unique
+  projectName String  @default("Hub")
+  bgUrl       String  @default("")
+  setupUser   String  @default("System")
+  adminRoleId String  @default("")
+  hwidResetCooldownHours Int?
+  scripts     String  @default("{}")
+}
+
+model GuildLicense {
+  guildId   String  @id
+  expiresAt Int
+  note      String  @default("")
+  active    Boolean @default(true)
+  createdAt Int     @default(0)
+}
