@@ -710,6 +710,7 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply({ content: `Redeem สำเร็จ!\n**Duration:** ${result.duration === -1 ? "ถาวร" : `${Math.floor(result.duration/86400)} วัน`}` });
     }
 });
-
+const http = require("http");
+http.createServer((req, res) => res.end("ok")).listen(process.env.PORT || 3000);
 client.login(TOKEN);
 
